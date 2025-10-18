@@ -20,8 +20,7 @@ async def execute_action(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> ActionExecuteResponse:
-    tool = registry.get(payload.name)
-    result = tool.handler(payload.params, user)
+    result = await registry.invoke(payload.name, payload.params, user)
     log_entry = AIInteraction(
         user_id=user.id,
         role="tool",

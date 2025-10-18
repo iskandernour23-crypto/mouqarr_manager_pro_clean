@@ -76,8 +76,7 @@ async def chat_endpoint(
     for message in chat_request.messages:
         if message.role == "assistant" and message.tool_calls:
             for call in message.tool_calls:
-                tool = registry.get(call.name)
-                result = tool.handler(call.arguments, user)
+                result = await registry.invoke(call.name, call.arguments, user)
                 chunk = ChatStreamChunk(
                     type="tool_result",
                     tool_name=call.name,
