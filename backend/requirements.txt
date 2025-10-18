@@ -1,0 +1,18 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+sqlalchemy==2.0.32
+asyncpg==0.29.0
+aiofiles==23.2.1
+alembic==1.13.2
+python-jose==3.3.0
+passlib[bcrypt]==1.7.4
+pydantic==1.10.15
+pydantic-settings==2.3.4
+apscheduler==3.10.4
+httpx==0.27.0
+pytest==8.3.2
+pytest-asyncio==0.23.7
+anyio==4.4.0
+
+# Optional for vector operations
+numpy==1.26.4

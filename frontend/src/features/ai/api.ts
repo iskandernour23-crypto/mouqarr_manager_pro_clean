@@ -35,10 +35,25 @@ interface StreamCallbacks {
 
 const decoder = new TextDecoder('utf-8');
 
-const buildHeaders = () => ({
-  'Content-Type': 'application/json',
-  Accept: 'text/event-stream',
-});
+const getAuthToken = () => {
+  if (typeof window === 'undefined') return undefined;
+  const stored = localStorage.getItem('mouqarr-auth');
+  if (!stored) return undefined;
+  try {
+    return JSON.parse(stored).token as string;
+  } catch (error) {
+    return undefined;
+  }
+};
+
+const buildHeaders = () => {
+  const token = getAuthToken();
+  return {
+    'Content-Type': 'application/json',
+    Accept: 'text/event-stream',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+};
 
 const parseSse = (buffer: string, emit: (chunk: ChatStreamChunk) => void) => {
   const events = buffer.split('\n\n');
@@ -64,9 +79,10 @@ export const streamChat = async (
   payload: ChatRequestPayload,
   callbacks: StreamCallbacks = {}
 ): Promise<void> => {
+  const headers = buildHeaders();
   const response = await fetch('/ai/chat', {
     method: 'POST',
-    headers: buildHeaders(),
+    headers,
     body: JSON.stringify(payload),
   });
 
@@ -103,10 +119,12 @@ export const streamChat = async (
 };
 
 export const executeAction = async (name: string, params: Record<string, unknown>) => {
+  const token = getAuthToken();
   const response = await fetch('/ai/actions/execute', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify({ name, params }),
   });
@@ -123,7 +141,10 @@ export interface SuggestionPayload {
 }
 
 export const fetchSuggestions = async (): Promise<SuggestionPayload[]> => {
-  const response = await fetch('/ai/suggest');
+  const token = getAuthToken();
+  const response = await fetch('/ai/suggest', {
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+  });
   if (!response.ok) {
     throw new Error('تعذر تحميل الاقتراحات.');
   }

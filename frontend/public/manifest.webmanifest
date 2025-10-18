@@ -1,0 +1,11 @@
+{
+  "name": "مقر برو - إدارة المجمع",
+  "short_name": "مقر برو",
+  "lang": "ar",
+  "dir": "rtl",
+  "display": "standalone",
+  "start_url": "/",
+  "background_color": "#f8fafc",
+  "theme_color": "#4c6bff",
+  "icons": []
+}

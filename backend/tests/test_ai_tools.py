@@ -1,52 +1,25 @@
-import asyncio
-
 import pytest
-from fastapi.testclient import TestClient
-from jose import jwt
-
-from backend.app.main import app
-from backend.app.core.config import settings
-from backend.app.db.database import engine
-from backend.app.db.models import Base
-
-client = TestClient(app)
 
 
-def _make_token(role: str) -> str:
-    return jwt.encode({"sub": "user-test", "role": role}, settings.jwt_secret, algorithm=settings.jwt_algorithm)
-
-
-@pytest.fixture(scope="session", autouse=True)
-def setup_database() -> None:
-    async def _setup() -> None:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-    asyncio.run(_setup())
-    yield
-    async def _teardown() -> None:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
-    asyncio.run(_teardown())
-
-
-def test_execute_action_admin() -> None:
-    token = _make_token("admin")
+def test_execute_action_admin(client, seed_ids, token_factory):
+    token = token_factory(seed_ids["admin_id"], "admin")
     response = client.post(
         "/ai/actions/execute",
         headers={"Authorization": f"Bearer {token}"},
-        json={"name": "payments.summary", "params": {"period": "week"}},
+        json={"name": "summary_today", "params": {}},
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["name"] == "payments.summary"
+    assert body["name"] == "summary_today"
     assert body["result"]["status"] == "ok"
+    assert "invoices_due_today" in body["result"]
 
 
-def test_execute_action_forbidden() -> None:
-    token = _make_token("resident")
+def test_execute_action_forbidden(client, seed_ids, token_factory):
+    token = token_factory(seed_ids["resident_user_id"], "resident")
     response = client.post(
         "/ai/actions/execute",
         headers={"Authorization": f"Bearer {token}"},
-        json={"name": "payments.create_invoice", "params": {"resident_id": "1", "month": "2024-11"}},
+        json={"name": "pay_invoice", "params": {"invoice_id": seed_ids["invoice_id"]}},
     )
     assert response.status_code == 403

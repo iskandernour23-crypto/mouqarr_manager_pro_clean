@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict
+from datetime import date, datetime
+from typing import Any, Awaitable, Callable, Dict, Tuple
 
 from fastapi import HTTPException, status
+from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
 
 from backend.app.api.deps import User
+from backend.app.db import models
+from backend.app.db.database import AsyncSessionLocal
+from backend.app.services import notifier
+
+
+Handler = Callable[[Dict[str, Any], User], Awaitable[Dict[str, Any]]]
 
 
 @dataclass
@@ -13,8 +22,8 @@ class ToolDefinition:
     name: str
     description: str
     schema: Dict[str, Any]
-    allowed_roles: tuple[str, ...]
-    handler: Callable[[Dict[str, Any], User], Dict[str, Any]]
+    allowed_roles: Tuple[str, ...]
+    handler: Handler
 
 
 class ToolRegistry:
@@ -45,201 +54,191 @@ class ToolRegistry:
             )
         return tools
 
+    async def invoke(self, name: str, params: Dict[str, Any], user: User) -> Dict[str, Any]:
+        tool = self.get(name)
+        if tool.allowed_roles and user.role not in tool.allowed_roles:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        return await tool.handler(params, user)
+
 
 registry = ToolRegistry()
 
 
-def _require_role(user: User, allowed_roles: tuple[str, ...]) -> None:
-    if user.role not in allowed_roles:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+async def _pay_invoice(params: Dict[str, Any], user: User) -> Dict[str, Any]:
+    invoice_id = int(params["invoice_id"])
+    async with AsyncSessionLocal() as session:
+        invoice = await session.get(
+            models.Invoice,
+            invoice_id,
+            options=(selectinload(models.Invoice.resident).selectinload(models.Resident.user),),
+        )
+        if not invoice:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
+        invoice.status = models.InvoiceStatusEnum.paid.value
+        invoice.paid_at = datetime.utcnow()
+        payment = models.PaymentLog(
+            invoice_id=invoice.id,
+            amount=invoice.amount,
+            method=params.get("method", "assistant"),
+            status="success",
+        )
+        session.add(payment)
+        if invoice.resident and invoice.resident.user:
+            await notifier.create_notification(
+                session,
+                user_id=invoice.resident.user.id,
+                title="تم دفع الفاتورة",
+                body=f"تم دفع الفاتورة {invoice.reference} من خلال المساعد.",
+            )
+        await session.commit()
+        return {
+            "status": "paid",
+            "invoice_id": invoice.id,
+            "reference": invoice.reference,
+            "amount": float(invoice.amount),
+        }
 
 
-# Tool handlers
-
-def _residents_create(params: Dict[str, Any], user: User) -> Dict[str, Any]:
-    _require_role(user, ("admin", "supervisor"))
-    return {
-        "status": "created",
-        "entity": "resident",
-        "data": params,
-        "message": "تم إنشاء المقيم بنجاح",
-    }
-
-
-def _residents_find(params: Dict[str, Any], user: User) -> Dict[str, Any]:
-    _require_role(user, ("admin", "supervisor", "resident"))
-    query = params.get("query", "")
-    return {
-        "status": "ok",
-        "entity": "resident",
-        "data": [{"name": "أحمد علي", "unit": "12", "phone": "+966500000"}],
-        "query": query,
-    }
-
-
-def _payments_create_invoice(params: Dict[str, Any], user: User) -> Dict[str, Any]:
-    _require_role(user, ("admin", "supervisor"))
-    return {
-        "status": "invoice_created",
-        "entity": "invoice",
-        "data": params,
-    }
-
-
-def _payments_overdue(params: Dict[str, Any], user: User) -> Dict[str, Any]:
-    _require_role(user, ("admin", "supervisor"))
-    threshold = params.get("days_threshold", 30)
-    return {
-        "status": "ok",
-        "overdue_residents": [
-            {"resident": "خالد", "unit": "8", "days": threshold + 2},
-        ],
-    }
+async def _create_ticket(params: Dict[str, Any], user: User) -> Dict[str, Any]:
+    async with AsyncSessionLocal() as session:
+        ticket = models.MaintenanceTicket(
+            asset_id=params.get("asset_id"),
+            title=params["title"],
+            description=params.get("description"),
+            priority=params.get("priority", "medium"),
+            due_date=params.get("due_date"),
+            status="open",
+        )
+        session.add(ticket)
+        await session.flush()
+        supervisor_id = params.get("supervisor_id")
+        if supervisor_id:
+            supervisor = await session.get(
+                models.Supervisor,
+                int(supervisor_id),
+                options=(selectinload(models.Supervisor.user),),
+            )
+            if supervisor and supervisor.user:
+                ticket.assigned_to = supervisor.id
+                await notifier.create_notification(
+                    session,
+                    user_id=supervisor.user.id,
+                    title="تذكرة صيانة جديدة",
+                    body=ticket.title,
+                )
+        await session.commit()
+        return {
+            "status": "created",
+            "ticket_id": ticket.id,
+            "title": ticket.title,
+            "priority": ticket.priority,
+        }
 
 
-def _payments_summary(params: Dict[str, Any], user: User) -> Dict[str, Any]:
-    _require_role(user, ("admin", "supervisor"))
-    period = params.get("period", "week")
-    return {
-        "status": "ok",
-        "period": period,
-        "total": 12500,
-        "currency": "SAR",
-    }
+async def _notify_resident(params: Dict[str, Any], user: User) -> Dict[str, Any]:
+    resident_id = int(params["resident_id"])
+    async with AsyncSessionLocal() as session:
+        resident = await session.get(
+            models.Resident,
+            resident_id,
+            options=(selectinload(models.Resident.user),),
+        )
+        if not resident or not resident.user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resident not found")
+        message = params.get("text", "")
+        await notifier.create_notification(
+            session,
+            user_id=resident.user.id,
+            title="رسالة من الإدارة",
+            body=message,
+        )
+        await session.commit()
+        return {"status": "sent", "resident_id": resident.id}
 
 
-def _inventory_schedule_maintenance(params: Dict[str, Any], user: User) -> Dict[str, Any]:
-    _require_role(user, ("admin", "supervisor"))
-    return {
-        "status": "scheduled",
-        "entity": "maintenance",
-        "data": params,
-    }
-
-
-def _notifications_create(params: Dict[str, Any], user: User) -> Dict[str, Any]:
-    _require_role(user, ("admin", "supervisor"))
-    return {
-        "status": "queued",
-        "entity": "notification",
-        "data": params,
-    }
+async def _summary_today(params: Dict[str, Any], user: User) -> Dict[str, Any]:
+    today = date.today()
+    async with AsyncSessionLocal() as session:
+        invoice_q = await session.execute(
+            select(func.count()).select_from(models.Invoice).where(models.Invoice.due_date == today)
+        )
+        due_today = invoice_q.scalar_one()
+        overdue_q = await session.execute(
+            select(func.count()).select_from(models.Invoice).where(models.Invoice.status == models.InvoiceStatusEnum.overdue.value)
+        )
+        overdue_total = overdue_q.scalar_one()
+        tickets_q = await session.execute(
+            select(func.count()).select_from(models.MaintenanceTicket).where(models.MaintenanceTicket.status == "open")
+        )
+        open_tickets = tickets_q.scalar_one()
+        return {
+            "status": "ok",
+            "invoices_due_today": due_today,
+            "overdue_invoices": overdue_total,
+            "open_tickets": open_tickets,
+        }
 
 
 def init_tools() -> None:
     registry.register(
         ToolDefinition(
-            name="residents.create",
-            description="إنشاء مقيم جديد",
+            name="pay_invoice",
+            description="دفع فاتورة محددة",
             schema={
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
-                    "phone": {"type": "string"},
-                    "unit": {"type": "string"},
-                    "start_date": {"type": "string", "format": "date"},
+                    "invoice_id": {"type": "integer"},
+                    "method": {"type": "string"},
                 },
-                "required": ["name", "unit"],
+                "required": ["invoice_id"],
             },
             allowed_roles=("admin", "supervisor"),
-            handler=_residents_create,
+            handler=_pay_invoice,
         )
     )
     registry.register(
         ToolDefinition(
-            name="residents.find",
-            description="البحث عن مقيم",
-            schema={
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-            },
-            allowed_roles=("admin", "supervisor", "resident"),
-            handler=_residents_find,
-        )
-    )
-    registry.register(
-        ToolDefinition(
-            name="payments.create_invoice",
-            description="إنشاء فاتورة",
-            schema={
-                "type": "object",
-                "properties": {
-                    "resident_id": {"type": "string"},
-                    "month": {"type": "string"},
-                    "services": {
-                        "type": "object",
-                        "properties": {
-                            "rent": {"type": "number"},
-                            "water": {"type": "number"},
-                            "electricity": {"type": "number"},
-                            "maintenance": {"type": "number"},
-                        },
-                    },
-                },
-                "required": ["resident_id", "month"],
-            },
-            allowed_roles=("admin", "supervisor"),
-            handler=_payments_create_invoice,
-        )
-    )
-    registry.register(
-        ToolDefinition(
-            name="payments.overdue",
-            description="قائمة المتأخرين",
-            schema={
-                "type": "object",
-                "properties": {"days_threshold": {"type": "integer", "default": 30}},
-            },
-            allowed_roles=("admin", "supervisor"),
-            handler=_payments_overdue,
-        )
-    )
-    registry.register(
-        ToolDefinition(
-            name="payments.summary",
-            description="ملخص المدفوعات",
-            schema={
-                "type": "object",
-                "properties": {
-                    "period": {"type": "string", "enum": ["day", "week", "month"]},
-                },
-            },
-            allowed_roles=("admin", "supervisor"),
-            handler=_payments_summary,
-        )
-    )
-    registry.register(
-        ToolDefinition(
-            name="inventory.schedule_maintenance",
-            description="جدولة صيانة عنصر",
-            schema={
-                "type": "object",
-                "properties": {
-                    "item_id": {"type": "string"},
-                    "date": {"type": "string", "format": "date"},
-                    "note": {"type": "string"},
-                },
-                "required": ["item_id", "date"],
-            },
-            allowed_roles=("admin", "supervisor"),
-            handler=_inventory_schedule_maintenance,
-        )
-    )
-    registry.register(
-        ToolDefinition(
-            name="notifications.create",
-            description="إرسال إشعار",
+            name="create_ticket",
+            description="إنشاء تذكرة صيانة",
             schema={
                 "type": "object",
                 "properties": {
                     "title": {"type": "string"},
-                    "body": {"type": "string"},
-                    "audience": {"type": "string"},
+                    "description": {"type": "string"},
+                    "asset_id": {"type": "integer"},
+                    "priority": {"type": "string"},
+                    "due_date": {"type": "string", "format": "date"},
+                    "supervisor_id": {"type": "integer"},
                 },
-                "required": ["title", "body"],
+                "required": ["title"],
             },
             allowed_roles=("admin", "supervisor"),
-            handler=_notifications_create,
+            handler=_create_ticket,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="notify_resident",
+            description="إرسال إشعار للمقيم",
+            schema={
+                "type": "object",
+                "properties": {
+                    "resident_id": {"type": "integer"},
+                    "text": {"type": "string"},
+                },
+                "required": ["resident_id", "text"],
+            },
+            allowed_roles=("admin", "supervisor"),
+            handler=_notify_resident,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="summary_today",
+            description="ملخص اليوم للمشرفين",
+            schema={"type": "object", "properties": {}},
+            allowed_roles=("admin", "supervisor"),
+            handler=_summary_today,
         )
     )
 
